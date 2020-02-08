@@ -176,6 +176,7 @@ type Options struct {
 	Cluster               ClusterOpts   `json:"cluster,omitempty"`
 	Gateway               GatewayOpts   `json:"gateway,omitempty"`
 	LeafNode              LeafNodeOpts  `json:"leaf,omitempty"`
+	Websocket             WebsocketOpts `json:"-"`
 	ProfPort              int           `json:"-"`
 	PidFile               string        `json:"-"`
 	PortsFileDir          string        `json:"-"`
@@ -230,6 +231,42 @@ type Options struct {
 	// private fields, used for testing
 	gatewaysSolicitDelay time.Duration
 	routeProto           int
+}
+
+// WebsocketOpts ...
+type WebsocketOpts struct {
+	Host      string
+	Port      int
+	TLSConfig *tls.Config
+
+	// Enable checking of Origin header if present in the request.
+	CheckOrigin bool
+
+	// If CheckOrigin is true, checks that the Origin header is
+	// equal to this value, unless this option is empty, in which
+	// case, checks that it is equal to the request's Host value.
+	Origin string
+
+	// If set to true, the server will negotiate with clients
+	// if compression can be used. If this is false, no compression
+	// will be used (both in server and clients) since it has to
+	// be negotiated between both endpoints
+	Compression bool
+
+	// Compression level used by compress/flate algorithm.
+	// Possible values are:
+	// -1: default compression
+	// -2: HuffmanOnly
+	//  0: no compression, just adds the necessary DEFLATE framing
+	//  1: best speed
+	// ..
+	//  9: best compression
+	CompressionLevel int
+
+	// Total time allowed for the server to read the client request
+	// and write the response back to the client. This include the
+	// time needed for the TLS Handshake if TLS is used.
+	HandshakeTimeout time.Duration
 }
 
 type netResolver interface {
@@ -819,6 +856,11 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 		o.ConnectErrorReports = int(v.(int64))
 	case "reconnect_error_reports":
 		o.ReconnectErrorReports = int(v.(int64))
+	case "websocket":
+		if err := parseWebsocket(tk, o, errors, warnings); err != nil {
+			*errors = append(*errors, err)
+			return
+		}
 	default:
 		if au := atomic.LoadInt32(&allowUnknownTopLevelField); au == 0 && !tk.IsUsedVariable() {
 			err := &unknownConfigFieldErr{
@@ -2676,6 +2718,78 @@ func parseTLS(v interface{}) (t *TLSConfigOpts, retErr error) {
 	return &tc, nil
 }
 
+func parseWebsocket(v interface{}, o *Options, errors *[]error, warnings *[]error) error {
+	var lt token
+	defer convertPanicToErrorList(&lt, errors)
+
+	tk, v := unwrapValue(v, &lt)
+	gm, ok := v.(map[string]interface{})
+	if !ok {
+		return &configErr{tk, fmt.Sprintf("Expected websocket to be a map, got %T", v)}
+	}
+	for mk, mv := range gm {
+		// Again, unwrap token value if line check is required.
+		tk, mv = unwrapValue(mv, &lt)
+		switch strings.ToLower(mk) {
+		case "listen":
+			hp, err := parseListen(mv)
+			if err != nil {
+				err := &configErr{tk, err.Error()}
+				*errors = append(*errors, err)
+				continue
+			}
+			o.Websocket.Host = hp.host
+			o.Websocket.Port = hp.port
+		case "port":
+			o.Websocket.Port = int(mv.(int64))
+		case "host", "net":
+			o.Websocket.Host = mv.(string)
+		case "tls":
+			config, _, err := getTLSConfig(tk)
+			if err != nil {
+				*errors = append(*errors, err)
+				continue
+			}
+			o.Websocket.TLSConfig = config
+		case "check_origin":
+			o.Websocket.CheckOrigin = mv.(bool)
+		case "origin":
+			o.Websocket.Origin = mv.(string)
+		case "compression":
+			o.Websocket.Compression = mv.(bool)
+		case "compression_level":
+			o.Websocket.CompressionLevel = int(mv.(int64))
+		case "handshake_timeout":
+			ht := time.Duration(0)
+			switch mv := mv.(type) {
+			case int64:
+				ht = time.Duration(mv) * time.Second
+			case string:
+				var err error
+				ht, err = time.ParseDuration(mv)
+				if err != nil {
+					err := &configErr{tk, err.Error()}
+					*errors = append(*errors, err)
+					continue
+				}
+			}
+			o.Websocket.HandshakeTimeout = ht
+		default:
+			if !tk.IsUsedVariable() {
+				err := &unknownConfigFieldErr{
+					field: mk,
+					configErr: configErr{
+						token: tk,
+					},
+				}
+				*errors = append(*errors, err)
+				continue
+			}
+		}
+	}
+	return nil
+}
+
 // GenTLSConfig loads TLS related configuration parameters.
 func GenTLSConfig(tc *TLSConfigOpts) (*tls.Config, error) {
 	// Create the tls.Config from our options before including the certs.
@@ -3007,6 +3121,11 @@ func setBaselineOptions(opts *Options) {
 	}
 	if opts.ReconnectErrorReports == 0 {
 		opts.ReconnectErrorReports = DEFAULT_RECONNECT_ERROR_REPORTS
+	}
+	if opts.Websocket.Port != 0 {
+		if opts.Websocket.Host == "" {
+			opts.Websocket.Host = DEFAULT_HOST
+		}
 	}
 }
 
