@@ -208,6 +208,8 @@ type Server struct {
 
 type srvWebsocket struct {
 	server           *http.Server
+	listener         net.Listener
+	tls              bool
 	compressionLevel int
 }
 
@@ -290,7 +292,7 @@ func NewServer(opts *Options) (*Server, error) {
 	defer s.mu.Unlock()
 
 	// Capture option's compression level in the server object
-	// for faster access (needed in webscoket clients when sending)
+	// for faster access (needed in websocket clients when sending)
 	s.websocket.compressionLevel = opts.Websocket.CompressionLevel
 
 	// Ensure that non-exported options (used in tests) are properly set.
@@ -1294,6 +1296,7 @@ func (s *Server) Shutdown() {
 		doneExpected++
 		s.websocket.server.Close()
 		s.websocket.server = nil
+		s.websocket.listener = nil
 	}
 
 	// Kick leafnodes AcceptLoop()
@@ -2319,6 +2322,7 @@ type Ports struct {
 	Monitoring []string `json:"monitoring,omitempty"`
 	Cluster    []string `json:"cluster,omitempty"`
 	Profile    []string `json:"profile,omitempty"`
+	WebSocket  []string `json:"websocket,omitempty"`
 }
 
 // PortsInfo attempts to resolve all the ports. If after maxWait the ports are not
@@ -2334,6 +2338,8 @@ func (s *Server) PortsInfo(maxWait time.Duration) *Ports {
 		httpListener := s.http
 		clusterListener := s.routeListener
 		profileListener := s.profiler
+		wsListener := s.websocket.listener
+		wss := s.websocket.tls
 		s.mu.Unlock()
 
 		ports := Ports{}
@@ -2364,6 +2370,14 @@ func (s *Server) PortsInfo(maxWait time.Duration) *Ports {
 
 		if profileListener != nil {
 			ports.Profile = formatURL("http", profileListener)
+		}
+
+		if wsListener != nil {
+			protocol := "ws"
+			if wss {
+				protocol = "wss"
+			}
+			ports.WebSocket = formatURL(protocol, wsListener)
 		}
 
 		return &ports
@@ -2468,6 +2482,9 @@ func (s *Server) serviceListeners() []net.Listener {
 	}
 	if opts.ProfPort != 0 {
 		listeners = append(listeners, s.profiler)
+	}
+	if opts.Websocket.Port != 0 {
+		listeners = append(listeners, s.websocket.listener)
 	}
 	return listeners
 }

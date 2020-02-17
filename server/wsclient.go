@@ -702,6 +702,8 @@ func (s *Server) startWebsocketServer() {
 	}
 	s.mu.Lock()
 	s.websocket.server = hs
+	s.websocket.listener = hl
+	s.websocket.tls = proto == "wss"
 	if port == -1 {
 		s.opts.Websocket.Port = hl.Addr().(*net.TCPAddr).Port
 	}
