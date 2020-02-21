@@ -1667,7 +1667,12 @@ func (c *client) enqueueProtoAndFlush(proto []byte, doFlush bool) {
 		// partial writes. Also, when there is a need to send WS control
 		// messages, these need to be framed separately.
 		var wsfh []byte
-		wsfh, proto = c.wsCreateFrameAndPayload(wsBinaryMessage, proto)
+		cl := defaultCompressionLevel
+		if c.srv != nil {
+			cl = c.srv.websocket.compressionLevel
+		}
+		wsfh, proto = wsCreateFrameAndPayload(wsBinaryMessage,
+			c.flags.isSet(wsCompress), cl, proto)
 		c.queueOutbound(wsfh)
 	}
 	c.queueOutbound(proto)

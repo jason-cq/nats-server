@@ -302,7 +302,7 @@ func (c *client) wsHandleControlFrame(r *wsReadInfo, frameType wsOpCode, nc io.R
 				body = "invalid utf8 body in close frame"
 			}
 		}
-		c.wsEnqueueControlMessage(wsCloseMessage, wsFrameCloseMessage(status, body))
+		c.wsEnqueueControlMessage(wsCloseMessage, wsCreateCloseMessage(status, body))
 		// Return io.EOF so that readLoop will close the connection as ClientClosed
 		// after processing pending buffers.
 		return pos, io.EOF
@@ -350,16 +350,9 @@ func wsIsControlFrame(frameType wsOpCode) bool {
 }
 
 // Creates a frame header for the given op code and possibly compress the given `payload`
-//
-// Client lock is held on entry.
-func (c *client) wsCreateFrameAndPayload(frameType wsOpCode, payload []byte) ([]byte, []byte) {
-	compress := c.flags.isSet(wsCompress) && !wsIsControlFrame(frameType)
+func wsCreateFrameAndPayload(frameType wsOpCode, compress bool, cl int, payload []byte) ([]byte, []byte) {
+	compress = compress && !wsIsControlFrame(frameType)
 	if compress {
-		// In case server object not avail, use default compression.
-		cl := defaultCompressionLevel
-		if c.srv != nil {
-			cl = c.srv.websocket.compressionLevel
-		}
 		buf := &bytes.Buffer{}
 		cpool := &(compressorPool[cl-minCompressionLevel])
 		compressor, _ := cpool.Get().(*flate.Writer)
@@ -379,12 +372,12 @@ func (c *client) wsCreateFrameAndPayload(frameType wsOpCode, payload []byte) ([]
 
 // Create the frame header.
 // Encodes the frame type and optional compression flag, and the size of the payload.
-func wsFrameMessage(compress bool, frameType wsOpCode, l int) []byte {
+func wsFrameMessage(compressed bool, frameType wsOpCode, l int) []byte {
 	// websocket frame header
 	var fh []byte
 
 	b := byte(frameType | wsFinalBit)
-	if compress {
+	if compressed {
 		b |= wsRsv1Bit
 	}
 
@@ -460,7 +453,7 @@ func (c *client) wsEnqueueCloseMessage(reason ClosedState) {
 	default:
 		status = wsCloseStatusInternalSrvError
 	}
-	body := wsFrameCloseMessage(status, reason.String())
+	body := wsCreateCloseMessage(status, reason.String())
 	c.wsEnqueueControlMessageLocked(wsCloseMessage, body)
 }
 
@@ -469,16 +462,16 @@ func (c *client) wsEnqueueCloseMessage(reason ClosedState) {
 //
 // Lock MUST NOT be held on entry.
 func (c *client) wsHandleProtocolError(message string) error {
-	buf := wsFrameCloseMessage(wsCloseStatusProtocolError, message)
+	buf := wsCreateCloseMessage(wsCloseStatusProtocolError, message)
 	c.wsEnqueueControlMessage(wsCloseMessage, buf)
 	return fmt.Errorf(message)
 }
 
-// Create a frame for a close message with the given `status` and `body`.
+// Create a close message with the given `status` and `body`.
 // If the `body` is more than the maximum allows control frame payload size,
 // it is truncated and "..." is added at the end (as a hint that message
 // is not complete).
-func wsFrameCloseMessage(status int, body string) []byte {
+func wsCreateCloseMessage(status int, body string) []byte {
 	// Since a control message payload is limited in size, we
 	// will limit the text and add trailing "..." if truncated.
 	if len(body) > wsMaxControlPayloadSize {
