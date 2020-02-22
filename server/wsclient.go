@@ -234,13 +234,11 @@ func (c *client) wsRead(r *wsReadInfo, ior io.Reader, buf []byte) ([][]byte, err
 			b = buf[pos : pos+n]
 			pos += n
 			r.rem -= n
-			if r.fc && r.rem > 0 {
+			if r.fc {
 				r.buf = append(r.buf, b...)
-			} else {
-				if r.fc && r.buf != nil {
-					r.buf = append(r.buf, b...)
-					b = r.buf
-				}
+				b = r.buf
+			}
+			if !r.fc || r.rem == 0 {
 				r.unmask(b)
 				if r.fc {
 					// As per https://tools.ietf.org/html/rfc7692#section-7.2.2

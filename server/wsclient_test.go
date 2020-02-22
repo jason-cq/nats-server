@@ -18,6 +18,7 @@ import (
 	"compress/flate"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 )
@@ -33,19 +34,19 @@ func (tr *testReader) Read(p []byte) (int, error) {
 	if tr.err != nil {
 		return 0, tr.err
 	}
-	left := len(tr.buf) - tr.pos
-	if left == 0 {
+	n := len(tr.buf) - tr.pos
+	if n == 0 {
 		return 0, nil
 	}
-	if left > cap(p) {
-		left = cap(p)
+	if n > cap(p) {
+		n = cap(p)
 	}
-	if tr.max > 0 && left > tr.max {
-		left = tr.max
+	if tr.max > 0 && n > tr.max {
+		n = tr.max
 	}
-	copy(p, tr.buf[tr.pos:tr.pos+left])
-	tr.pos += left
-	return left, nil
+	copy(p, tr.buf[tr.pos:tr.pos+n])
+	tr.pos += n
+	return n, nil
 }
 
 func TestWSGet(t *testing.T) {
@@ -283,8 +284,8 @@ func TestWSCreateFrameAndPayload(t *testing.T) {
 		{"binary compressed", wsBinaryMessage, true},
 		{"text", wsTextMessage, false},
 		{"text compressed", wsTextMessage, true},
-		{"close", wsCloseMessage, false},
-		{"close compressed", wsCloseMessage, true},
+		{"ping", wsPingMessage, false},
+		{"ping compressed", wsPingMessage, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			// If compression, stress the fact that we use a pool and
@@ -317,7 +318,7 @@ func TestWSCreateFrameAndPayload(t *testing.T) {
 	}
 }
 
-func testWSCreateClientMsg(frameType wsOpCode, final, compressed bool, payload []byte) []byte {
+func testWSCreateClientMsg(frameType wsOpCode, frameNum int, final, compressed bool, payload []byte) []byte {
 	if compressed {
 		buf := &bytes.Buffer{}
 		compressor, _ := flate.NewWriter(buf, 1)
@@ -328,7 +329,9 @@ func testWSCreateClientMsg(frameType wsOpCode, final, compressed bool, payload [
 		payload = payload[:len(payload)-4]
 	}
 	frame := make([]byte, 14+len(payload))
-	frame[0] = byte(frameType)
+	if frameNum == 1 {
+		frame[0] = byte(frameType)
+	}
 	if final {
 		frame[0] |= wsFinalBit
 	}
@@ -359,25 +362,25 @@ func testWSCreateClientMsg(frameType wsOpCode, final, compressed bool, payload [
 	return frame[:pos]
 }
 
-func TestWSRead(t *testing.T) {
-	reset := func() *wsReadInfo {
-		ri := &wsReadInfo{}
-		ri.init()
-		return ri
-	}
-	ri := reset()
-
+func testWSSetupForRead() (*client, *wsReadInfo, *testReader) {
+	ri := &wsReadInfo{}
+	ri.init()
 	tr := &testReader{}
-
-	s := &Server{opts: DefaultOptions()}
+	opts := DefaultOptions()
+	opts.MaxPending = MAX_PENDING_SIZE
+	s := &Server{opts: opts}
 	c := &client{srv: s, flags: wsClient}
 	c.initClient()
+	return c, ri, tr
+}
 
+func TestWSReadUncompressedFrames(t *testing.T) {
+	c, ri, tr := testWSSetupForRead()
 	// Create 2 WS messages
 	pl1 := []byte("first message")
-	wsmsg1 := testWSCreateClientMsg(wsBinaryMessage, true, false, pl1)
+	wsmsg1 := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, pl1)
 	pl2 := []byte("second message")
-	wsmsg2 := testWSCreateClientMsg(wsBinaryMessage, true, false, pl2)
+	wsmsg2 := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, pl2)
 	// Add both in single buffer
 	orgrb := append([]byte(nil), wsmsg1...)
 	orgrb = append(orgrb, wsmsg2...)
@@ -398,7 +401,7 @@ func TestWSRead(t *testing.T) {
 	}
 
 	// Now reset and try with the read buffer not containing full ws frame
-	ri = reset()
+	c, ri, tr = testWSSetupForRead()
 	rb = append([]byte(nil), orgrb...)
 	// Frame is 1+1+4+'first message'. So say we pass with rb of 11 bytes,
 	// then we should get "first"
@@ -437,14 +440,15 @@ func TestWSRead(t *testing.T) {
 	if string(bufs[0]) != "message" {
 		t.Fatalf("Unexpected content: %q", bufs[0])
 	}
+}
 
-	// Reset again and now try with compressed data.
-	ri = reset()
+func TestWSReadCompressedFrames(t *testing.T) {
+	c, ri, tr := testWSSetupForRead()
 	uncompressed := []byte("this is the uncompress data")
-	wsmsg1 = testWSCreateClientMsg(wsBinaryMessage, true, true, uncompressed)
-	rb = append([]byte(nil), wsmsg1...)
+	wsmsg1 := testWSCreateClientMsg(wsBinaryMessage, 1, true, true, uncompressed)
+	rb := append([]byte(nil), wsmsg1...)
 	// Call with some but not all of the payload
-	bufs, err = c.wsRead(ri, tr, rb[:10])
+	bufs, err := c.wsRead(ri, tr, rb[:10])
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -462,16 +466,491 @@ func TestWSRead(t *testing.T) {
 	if !bytes.Equal(bufs[0], uncompressed) {
 		t.Fatalf("Unexpected content: %s", bufs[0])
 	}
-
-	// Corrupt the compressed data now
-	ri = reset()
-	copy(wsmsg1[10:], []byte{1, 2, 3, 4})
-	rb = append([]byte(nil), wsmsg1...)
+	// Stress the fact that we use a pool and want to make sure
+	// that if we get a decompressor from the pool, it is properly reset
+	// with the buffer to decompress.
+	for i := 0; i < 9; i++ {
+		rb = append(rb, wsmsg1...)
+	}
 	bufs, err = c.wsRead(ri, tr, rb)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if n := len(bufs); n != 10 {
+		t.Fatalf("Unexpected buffer returned: %v", n)
+	}
+}
+
+func TestWSReadCompressedFrameCorrupted(t *testing.T) {
+	c, ri, tr := testWSSetupForRead()
+	uncompressed := []byte("this is the uncompress data")
+	wsmsg1 := testWSCreateClientMsg(wsBinaryMessage, 1, true, true, uncompressed)
+	copy(wsmsg1[10:], []byte{1, 2, 3, 4})
+	rb := append([]byte(nil), wsmsg1...)
+	bufs, err := c.wsRead(ri, tr, rb)
 	if err == nil || !strings.Contains(err.Error(), "corrupt") {
 		t.Fatalf("Expected error about corrupted data, got %v", err)
 	}
 	if n := len(bufs); n != 0 {
 		t.Fatalf("Expected no buffer, got %v", n)
+	}
+}
+
+func TestWSReadVariousFrameSizes(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		size int
+	}{
+		{"tiny", 100},
+		{"medium", 1000},
+		{"large", 70000},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, ri, tr := testWSSetupForRead()
+			uncompressed := make([]byte, test.size)
+			for i := 0; i < len(uncompressed); i++ {
+				uncompressed[i] = 'A' + byte(i%26)
+			}
+			wsmsg1 := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, uncompressed)
+			rb := append([]byte(nil), wsmsg1...)
+			bufs, err := c.wsRead(ri, tr, rb)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if n := len(bufs); n != 1 {
+				t.Fatalf("Unexpected buffer returned: %v", n)
+			}
+			if !bytes.Equal(bufs[0], uncompressed) {
+				t.Fatalf("Unexpected content: %s", bufs[0])
+			}
+		})
+	}
+}
+
+func TestWSReadFragmentedFrames(t *testing.T) {
+	c, ri, tr := testWSSetupForRead()
+	payloads := []string{"first", "second", "third"}
+	var rb []byte
+	for i := 0; i < len(payloads); i++ {
+		final := i == len(payloads)-1
+		frag := testWSCreateClientMsg(wsBinaryMessage, i+1, final, false, []byte(payloads[i]))
+		rb = append(rb, frag...)
+	}
+	bufs, err := c.wsRead(ri, tr, rb)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if n := len(bufs); n != 3 {
+		t.Fatalf("Unexpected buffer returned: %v", n)
+	}
+	for i, expected := range payloads {
+		if string(bufs[i]) != expected {
+			t.Fatalf("Unexpected content for buf=%v: %s", i, bufs[i])
+		}
+	}
+}
+
+func TestWSReadPartialFrameHeaderAtEndOfReadBuffer(t *testing.T) {
+	c, ri, tr := testWSSetupForRead()
+	msg1 := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("msg1"))
+	msg2 := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("msg2"))
+	rb := append([]byte(nil), msg1...)
+	rb = append(rb, msg2...)
+	// We will pass the first frame + the first byte of the next frame.
+	rbl := rb[:len(msg1)+1]
+	// Make the io reader return the rest of the frame
+	tr.buf = rb[len(msg1)+1:]
+	bufs, err := c.wsRead(ri, tr, rbl)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if n := len(bufs); n != 1 {
+		t.Fatalf("Unexpected buffer returned: %v", n)
+	}
+	// We should not have asked to the io reader more than what is needed for reading
+	// the frame header. Since we had already the first byte in the read buffer,
+	// tr.pos should be 1(size)+4(key)=5
+	if tr.pos != 5 {
+		t.Fatalf("Expected reader pos to be 5, got %v", tr.pos)
+	}
+}
+
+func TestWSReadPingFrame(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		payload []byte
+	}{
+		{"without payload", nil},
+		{"with payload", []byte("optional payload")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, ri, tr := testWSSetupForRead()
+			ping := testWSCreateClientMsg(wsPingMessage, 1, true, false, test.payload)
+			rb := append([]byte(nil), ping...)
+			bufs, err := c.wsRead(ri, tr, rb)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if n := len(bufs); n != 0 {
+				t.Fatalf("Unexpected buffer returned: %v", n)
+			}
+			// A PONG should have been queued with the payload of the ping
+			c.mu.Lock()
+			nb := c.collapsePtoNB()
+			c.mu.Unlock()
+			if n := len(nb); n == 0 {
+				t.Fatalf("Expected buffers, got %v", n)
+			}
+			if expected := 2 + len(test.payload); expected != len(nb[0]) {
+				t.Fatalf("Expected buffer to be %v bytes long, got %v", expected, len(nb[0]))
+			}
+			b := nb[0][0]
+			if b&wsFinalBit == 0 {
+				t.Fatalf("Control frame should have been the final flag, it was not set: %v", b)
+			}
+			if b&byte(wsPongMessage) == 0 {
+				t.Fatalf("Should have been a PONG, it wasn't: %v", b)
+			}
+			if len(test.payload) > 0 {
+				if !bytes.Equal(nb[0][2:], test.payload) {
+					t.Fatalf("Unexpected content: %s", nb[0][2:])
+				}
+			}
+		})
+	}
+}
+
+func TestWSReadPongFrame(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		payload []byte
+	}{
+		{"without payload", nil},
+		{"with payload", []byte("optional payload")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, ri, tr := testWSSetupForRead()
+			pong := testWSCreateClientMsg(wsPongMessage, 1, true, false, test.payload)
+			rb := append([]byte(nil), pong...)
+			bufs, err := c.wsRead(ri, tr, rb)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if n := len(bufs); n != 0 {
+				t.Fatalf("Unexpected buffer returned: %v", n)
+			}
+			// Nothing should be sent...
+			c.mu.Lock()
+			nb := c.collapsePtoNB()
+			c.mu.Unlock()
+			if n := len(nb); n != 0 {
+				t.Fatalf("Expected no buffer, got %v", n)
+			}
+		})
+	}
+}
+
+func TestWSReadCloseFrame(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		payload []byte
+	}{
+		{"without payload", nil},
+		{"with payload", []byte("optional payload")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, ri, tr := testWSSetupForRead()
+			// a close message has a status in 2 bytes + optional payload
+			payload := make([]byte, 2+len(test.payload))
+			binary.BigEndian.PutUint16(payload[:2], wsCloseStatusNormalClosure)
+			if len(test.payload) > 0 {
+				copy(payload[2:], test.payload)
+			}
+			close := testWSCreateClientMsg(wsCloseMessage, 1, true, false, payload)
+			// Have a normal frame prior to close to make sure that wsRead returns
+			// the normal frame along with io.EOF to indicate that wsCloseMessage was received.
+			msg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("msg"))
+			rb := append([]byte(nil), msg...)
+			rb = append(rb, close...)
+			bufs, err := c.wsRead(ri, tr, rb)
+			// It is expected that wsRead returns io.EOF on processing a close.
+			if err != io.EOF {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if n := len(bufs); n != 1 {
+				t.Fatalf("Unexpected buffer returned: %v", n)
+			}
+			if string(bufs[0]) != "msg" {
+				t.Fatalf("Unexpected content: %s", bufs[0])
+			}
+			// A CLOSE should have been queued with the payload of the original close message.
+			c.mu.Lock()
+			nb := c.collapsePtoNB()
+			c.mu.Unlock()
+			if n := len(nb); n == 0 {
+				t.Fatalf("Expected buffers, got %v", n)
+			}
+			if expected := 2 + 2 + len(test.payload); expected != len(nb[0]) {
+				t.Fatalf("Expected buffer to be %v bytes long, got %v", expected, len(nb[0]))
+			}
+			b := nb[0][0]
+			if b&wsFinalBit == 0 {
+				t.Fatalf("Control frame should have been the final flag, it was not set: %v", b)
+			}
+			if b&byte(wsCloseMessage) == 0 {
+				t.Fatalf("Should have been a CLOSE, it wasn't: %v", b)
+			}
+			if status := binary.BigEndian.Uint16(nb[0][2:4]); status != wsCloseStatusNormalClosure {
+				t.Fatalf("Expected status to be %v, got %v", wsCloseStatusNormalClosure, status)
+			}
+			if len(test.payload) > 0 {
+				if !bytes.Equal(nb[0][4:], test.payload) {
+					t.Fatalf("Unexpected content: %s", nb[0][4:])
+				}
+			}
+		})
+	}
+}
+
+func TestWSReadControlFrameBetweebFragmentedFrames(t *testing.T) {
+	c, ri, tr := testWSSetupForRead()
+	frag1 := testWSCreateClientMsg(wsBinaryMessage, 1, false, false, []byte("first"))
+	frag2 := testWSCreateClientMsg(wsBinaryMessage, 2, true, false, []byte("second"))
+	ctrl := testWSCreateClientMsg(wsPongMessage, 1, true, false, nil)
+	rb := append([]byte(nil), frag1...)
+	rb = append(rb, ctrl...)
+	rb = append(rb, frag2...)
+	bufs, err := c.wsRead(ri, tr, rb)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if n := len(bufs); n != 2 {
+		t.Fatalf("Unexpected buffer returned: %v", n)
+	}
+	if string(bufs[0]) != "first" {
+		t.Fatalf("Unexpected content: %s", bufs[0])
+	}
+	if string(bufs[1]) != "second" {
+		t.Fatalf("Unexpected content: %s", bufs[1])
+	}
+}
+
+func TestWSReadGetErrors(t *testing.T) {
+	tr := &testReader{err: fmt.Errorf("on purpose")}
+	for _, test := range []struct {
+		lenPayload int
+		rbextra    int
+	}{
+		{10, 1},
+		{10, 3},
+		{200, 1},
+		{200, 2},
+		{200, 5},
+		{70000, 1},
+		{70000, 5},
+		{70000, 13},
+	} {
+		t.Run("", func(t *testing.T) {
+			c, ri, _ := testWSSetupForRead()
+			msg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("msg"))
+			frame := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, make([]byte, test.lenPayload))
+			rb := append([]byte(nil), msg...)
+			rb = append(rb, frame...)
+			bufs, err := c.wsRead(ri, tr, rb[:len(msg)+test.rbextra])
+			if err == nil || err.Error() != "on purpose" {
+				t.Fatalf("Expected 'on purpose' error, got %v", err)
+			}
+			if n := len(bufs); n != 1 {
+				t.Fatalf("Unexpected buffer returned: %v", n)
+			}
+			if string(bufs[0]) != "msg" {
+				t.Fatalf("Unexpected content: %s", bufs[0])
+			}
+		})
+	}
+}
+
+func TestWSHandleControlFrameErrors(t *testing.T) {
+	c, ri, tr := testWSSetupForRead()
+	tr.err = fmt.Errorf("on purpose")
+
+	// a close message has a status in 2 bytes + optional payload
+	text := []byte("this is a close message")
+	payload := make([]byte, 2+len(text))
+	binary.BigEndian.PutUint16(payload[:2], wsCloseStatusNormalClosure)
+	copy(payload[2:], text)
+	ctrl := testWSCreateClientMsg(wsCloseMessage, 1, true, false, payload)
+
+	bufs, err := c.wsRead(ri, tr, ctrl[:len(ctrl)-4])
+	if err == nil || err.Error() != "on purpose" {
+		t.Fatalf("Expected 'on purpose' error, got %v", err)
+	}
+	if n := len(bufs); n != 0 {
+		t.Fatalf("Unexpected buffer returned: %v", n)
+	}
+
+	// Alter the content of close message. It is supposed to be valid utf-8.
+	c, ri, tr = testWSSetupForRead()
+	cp := append([]byte(nil), payload...)
+	cp[10] = 0xF1
+	ctrl = testWSCreateClientMsg(wsCloseMessage, 1, true, false, cp)
+	bufs, err = c.wsRead(ri, tr, ctrl)
+	// We should still receive an EOF but the message enqueued to the client
+	// should contain wsCloseStatusInvalidPayloadData and the error about invalid utf8
+	if err != io.EOF {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if n := len(bufs); n != 0 {
+		t.Fatalf("Unexpected buffer returned: %v", n)
+	}
+	c.mu.Lock()
+	nb := c.collapsePtoNB()
+	c.mu.Unlock()
+	if n := len(nb); n == 0 {
+		t.Fatalf("Expected buffers, got %v", n)
+	}
+	b := nb[0][0]
+	if b&wsFinalBit == 0 {
+		t.Fatalf("Control frame should have been the final flag, it was not set: %v", b)
+	}
+	if b&byte(wsCloseMessage) == 0 {
+		t.Fatalf("Should have been a CLOSE, it wasn't: %v", b)
+	}
+	if status := binary.BigEndian.Uint16(nb[0][2:4]); status != wsCloseStatusInvalidPayloadData {
+		t.Fatalf("Expected status to be %v, got %v", wsCloseStatusInvalidPayloadData, status)
+	}
+	if !bytes.Contains(nb[0][4:], []byte("utf8")) {
+		t.Fatalf("Unexpected content: %s", nb[0][4:])
+	}
+}
+
+func TestWSReadErrors(t *testing.T) {
+	for _, test := range []struct {
+		cframe func() []byte
+		err    string
+		nbufs  int
+	}{
+		{
+			func() []byte {
+				msg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("hello"))
+				msg[1] &= ^byte(wsMaskBit)
+				return msg
+			},
+			"mask bit missing", 1,
+		},
+		{
+			func() []byte {
+				return testWSCreateClientMsg(wsPingMessage, 1, true, false, make([]byte, 200))
+			},
+			"control frame length bigger than maximum allowed", 1,
+		},
+		{
+			func() []byte {
+				return testWSCreateClientMsg(wsPingMessage, 1, false, false, []byte("hello"))
+			},
+			"control frame does not have final bit set", 1,
+		},
+		{
+			func() []byte {
+				frag1 := testWSCreateClientMsg(wsBinaryMessage, 1, false, false, []byte("frag1"))
+				newMsg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("new message"))
+				all := append([]byte(nil), frag1...)
+				all = append(all, newMsg...)
+				return all
+			},
+			"new message started before final frame for previous message was received", 2,
+		},
+		{
+			func() []byte {
+				frag1 := testWSCreateClientMsg(wsBinaryMessage, 1, false, true, []byte("frag1"))
+				frag2 := testWSCreateClientMsg(wsBinaryMessage, 2, false, true, []byte("frag2"))
+				frag2[0] |= wsRsv1Bit
+				all := append([]byte(nil), frag1...)
+				all = append(all, frag2...)
+				return all
+			},
+			"invalid continuation frame", 2,
+		},
+		{
+			func() []byte {
+				return testWSCreateClientMsg(99, 1, false, false, []byte("hello"))
+			},
+			"unknown opcode", 1,
+		},
+	} {
+		t.Run(test.err, func(t *testing.T) {
+			c, ri, tr := testWSSetupForRead()
+			// Add a valid message first
+			msg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("hello"))
+			// Then add the bad frame
+			bad := test.cframe()
+			// Add them both to a read buffer
+			rb := append([]byte(nil), msg...)
+			rb = append(rb, bad...)
+			bufs, err := c.wsRead(ri, tr, rb)
+			if err == nil || !strings.Contains(err.Error(), test.err) {
+				t.Fatalf("Expected error to contain %q, got %q", test.err, err.Error())
+			}
+			if n := len(bufs); n != test.nbufs {
+				t.Fatalf("Unexpected number of buffers: %v", n)
+			}
+			if string(bufs[0]) != "hello" {
+				t.Fatalf("Unexpected content: %s", bufs[0])
+			}
+		})
+	}
+}
+
+func TestWSEnqueueCloseMsg(t *testing.T) {
+	for _, test := range []struct {
+		reason ClosedState
+		status int
+	}{
+		{ClientClosed, wsCloseStatusNormalClosure},
+		{AuthenticationTimeout, wsCloseStatusPolicyViolation},
+		{AuthenticationViolation, wsCloseStatusPolicyViolation},
+		{SlowConsumerPendingBytes, wsCloseStatusPolicyViolation},
+		{SlowConsumerWriteDeadline, wsCloseStatusPolicyViolation},
+		{MaxAccountConnectionsExceeded, wsCloseStatusPolicyViolation},
+		{MaxConnectionsExceeded, wsCloseStatusPolicyViolation},
+		{MaxControlLineExceeded, wsCloseStatusPolicyViolation},
+		{MaxSubscriptionsExceeded, wsCloseStatusPolicyViolation},
+		{MissingAccount, wsCloseStatusPolicyViolation},
+		{AuthenticationExpired, wsCloseStatusPolicyViolation},
+		{Revocation, wsCloseStatusPolicyViolation},
+		{TLSHandshakeError, wsCloseStatusTLSHandshake},
+		{ParseError, wsCloseStatusProtocolError},
+		{ProtocolViolation, wsCloseStatusProtocolError},
+		{BadClientProtocolVersion, wsCloseStatusProtocolError},
+		{MaxPayloadExceeded, wsCloseStatusMessageTooBig},
+		{ServerShutdown, wsCloseStatusGoingAway},
+		{WriteError, wsCloseStatusAbnormalClosure},
+		{ReadError, wsCloseStatusAbnormalClosure},
+		{StaleConnection, wsCloseStatusAbnormalClosure},
+		{ClosedState(254), wsCloseStatusInternalSrvError},
+	} {
+		t.Run(test.reason.String(), func(t *testing.T) {
+			c, _, _ := testWSSetupForRead()
+			c.wsEnqueueCloseMessage(test.reason)
+			c.mu.Lock()
+			nb := c.collapsePtoNB()
+			c.mu.Unlock()
+			if n := len(nb); n != 1 {
+				t.Fatalf("Expected 1 buffer, got %v", n)
+			}
+			b := nb[0][0]
+			if b&wsFinalBit == 0 {
+				t.Fatalf("Control frame should have been the final flag, it was not set: %v", b)
+			}
+			if b&byte(wsCloseMessage) == 0 {
+				t.Fatalf("Should have been a CLOSE, it wasn't: %v", b)
+			}
+			if status := binary.BigEndian.Uint16(nb[0][2:4]); int(status) != test.status {
+				t.Fatalf("Expected status to be %v, got %v", test.status, status)
+			}
+			if string(nb[0][4:]) != test.reason.String() {
+				t.Fatalf("Unexpected content: %s", nb[0][4:])
+			}
+		})
 	}
 }
