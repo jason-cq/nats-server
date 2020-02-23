@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -950,6 +951,211 @@ func TestWSEnqueueCloseMsg(t *testing.T) {
 			}
 			if string(nb[0][4:]) != test.reason.String() {
 				t.Fatalf("Unexpected content: %s", nb[0][4:])
+			}
+		})
+	}
+}
+
+type testResponseWriter struct {
+	http.ResponseWriter
+	buf     bytes.Buffer
+	headers http.Header
+}
+
+func (trw *testResponseWriter) Write(p []byte) (int, error) {
+	return trw.buf.Write(p)
+}
+
+func (trw *testResponseWriter) WriteHeader(status int) {
+	trw.buf.WriteString(fmt.Sprintf("%v", status))
+}
+
+func (trw *testResponseWriter) Header() http.Header {
+	if trw.headers == nil {
+		trw.headers = make(http.Header)
+	}
+	return trw.headers
+}
+
+func testWSOptions() *Options {
+	opts := DefaultOptions()
+	opts.Websocket.Port = -1
+	return opts
+}
+
+func TestWSUpgradeValidationErrors(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		setup  func() (*Options, *http.Request)
+		err    string
+		status int
+	}{
+		{
+			"bad method",
+			func() (*Options, *http.Request) {
+				opts := testWSOptions()
+				req := &http.Request{Method: "POST"}
+				return opts, req
+			},
+			"must be GET",
+			http.StatusMethodNotAllowed,
+		},
+		{
+			"no host",
+			func() (*Options, *http.Request) {
+				opts := testWSOptions()
+				req := &http.Request{Method: "GET"}
+				return opts, req
+			},
+			"'Host' missing in request",
+			http.StatusBadRequest,
+		},
+		{
+			"invalid upgrade header",
+			func() (*Options, *http.Request) {
+				opts := testWSOptions()
+				req := &http.Request{Method: "GET", Host: "host"}
+				return opts, req
+			},
+			"invalid value for header 'Uprade'",
+			http.StatusBadRequest,
+		},
+		{
+			"invalid connection header",
+			func() (*Options, *http.Request) {
+				opts := testWSOptions()
+				req := &http.Request{Method: "GET", Host: "host"}
+				req.Header = make(http.Header)
+				req.Header.Set("Upgrade", "websocket")
+				return opts, req
+			},
+			"invalid value for header 'Connection'",
+			http.StatusBadRequest,
+		},
+		{
+			"no key",
+			func() (*Options, *http.Request) {
+				opts := testWSOptions()
+				req := &http.Request{Method: "GET", Host: "host"}
+				req.Header = make(http.Header)
+				req.Header.Set("Upgrade", "websocket")
+				req.Header.Set("Connection", "Upgrade")
+				return opts, req
+			},
+			"key missing",
+			http.StatusBadRequest,
+		},
+		{
+			"empty key",
+			func() (*Options, *http.Request) {
+				opts := testWSOptions()
+				req := &http.Request{Method: "GET", Host: "host"}
+				req.Header = make(http.Header)
+				req.Header.Set("Upgrade", "websocket")
+				req.Header.Set("Connection", "Upgrade")
+				req.Header.Set("Sec-Websocket-Key", "")
+				return opts, req
+			},
+			"key missing",
+			http.StatusBadRequest,
+		},
+		{
+			"missing version",
+			func() (*Options, *http.Request) {
+				opts := testWSOptions()
+				req := &http.Request{Method: "GET", Host: "host"}
+				req.Header = make(http.Header)
+				req.Header.Set("Upgrade", "websocket")
+				req.Header.Set("Connection", "Upgrade")
+				req.Header.Set("Sec-Websocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+				return opts, req
+			},
+			"invalid version",
+			http.StatusBadRequest,
+		},
+		{
+			"wrong version",
+			func() (*Options, *http.Request) {
+				opts := testWSOptions()
+				req := &http.Request{Method: "GET", Host: "host"}
+				req.Header = make(http.Header)
+				req.Header.Set("Upgrade", "websocket")
+				req.Header.Set("Connection", "Upgrade")
+				req.Header.Set("Sec-Websocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+				req.Header.Set("Sec-Websocket-Version", "99")
+				return opts, req
+			},
+			"invalid version",
+			http.StatusBadRequest,
+		},
+		{
+			"origin does not match request host",
+			func() (*Options, *http.Request) {
+				opts := testWSOptions()
+				opts.Websocket.CheckOrigin = true
+				req := &http.Request{Method: "GET", Host: "http://host.com"}
+				req.Header = make(http.Header)
+				req.Header.Set("Upgrade", "websocket")
+				req.Header.Set("Connection", "Upgrade")
+				req.Header.Set("Sec-Websocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+				req.Header.Set("Sec-Websocket-Version", "13")
+				req.Header.Set("Origin", "http://bad.host.com")
+				return opts, req
+			},
+			"invalid request origin",
+			http.StatusForbidden,
+		},
+		{
+			"origin does not match option origin",
+			func() (*Options, *http.Request) {
+				opts := testWSOptions()
+				opts.Websocket.CheckOrigin = true
+				opts.Websocket.Origin = "http://other.host.com"
+				req := &http.Request{Method: "GET", Host: "http://host.com"}
+				req.Header = make(http.Header)
+				req.Header.Set("Upgrade", "websocket")
+				req.Header.Set("Connection", "Upgrade")
+				req.Header.Set("Sec-Websocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+				req.Header.Set("Sec-Websocket-Version", "13")
+				req.Header.Set("Origin", "http://host.com")
+				return opts, req
+			},
+			"invalid request origin",
+			http.StatusForbidden,
+		},
+		{
+			"origin bad url",
+			func() (*Options, *http.Request) {
+				opts := testWSOptions()
+				opts.Websocket.CheckOrigin = true
+				opts.Websocket.Origin = "http://other.host.com"
+				req := &http.Request{Method: "GET", Host: "http://host.com"}
+				req.Header = make(http.Header)
+				req.Header.Set("Upgrade", "websocket")
+				req.Header.Set("Connection", "Upgrade")
+				req.Header.Set("Sec-Websocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+				req.Header.Set("Sec-Websocket-Version", "13")
+				req.Header.Set("Origin", "http://this is a :: bad url")
+				return opts, req
+			},
+			"invalid request origin",
+			http.StatusForbidden,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			opts, req := test.setup()
+			s := &Server{opts: opts}
+			rw := &testResponseWriter{}
+			res, err := s.wsUpgrade(rw, req)
+			if err == nil || !strings.Contains(err.Error(), test.err) {
+				t.Fatalf("Should get error %q, got %q", test.err, err)
+			}
+			if res != nil {
+				t.Fatalf("Should not have returned a result, got %v", res)
+			}
+			expected := fmt.Sprintf("%v%s\n", test.status, http.StatusText(test.status))
+			if got := rw.buf.String(); got != expected {
+				t.Fatalf("Expected %q got %q", expected, got)
 			}
 		})
 	}

@@ -617,9 +617,10 @@ func wsCheckOrigin(r *http.Request, expected string) bool {
 		return false
 	}
 	if expected == "" {
-		expected = u.Host
+		expected = r.Host
 	}
-	return strings.EqualFold(origin[0], expected)
+	res := strings.EqualFold(u.Host, expected)
+	return res
 }
 
 // Concatenate the key sent by the client with the GUID, then computes the SHA1 hash
