@@ -20,7 +20,6 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -533,11 +532,14 @@ func (s *Server) wsUpgrade(w http.ResponseWriter, r *http.Request) (*wsUpgradeRe
 	h := w.(http.Hijacker)
 	conn, brw, err := h.Hijack()
 	if err != nil {
+		if conn != nil {
+			conn.Close()
+		}
 		return nil, wsReturnHTTPError(w, http.StatusInternalServerError, err.Error())
 	}
 	if brw.Reader.Buffered() > 0 {
 		conn.Close()
-		return nil, errors.New("client sent data before handshake is complete")
+		return nil, wsReturnHTTPError(w, http.StatusBadRequest, "client sent data before handshake is complete")
 	}
 
 	var buf [1024]byte
@@ -696,7 +698,7 @@ func (s *Server) startWebsocketServer() {
 	s.websocket.server = hs
 	s.websocket.listener = hl
 	s.websocket.tls = proto == "wss"
-	if port == -1 {
+	if port == 0 {
 		s.opts.Websocket.Port = hl.Addr().(*net.TCPAddr).Port
 	}
 	s.mu.Unlock()

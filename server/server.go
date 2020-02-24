@@ -2152,7 +2152,11 @@ func (s *Server) ReadyForConnections(dur time.Duration) bool {
 	end := time.Now().Add(dur)
 	for time.Now().Before(end) {
 		s.mu.Lock()
-		ok := s.listener != nil && (opts.Cluster.Port == 0 || s.routeListener != nil) && (opts.Gateway.Name == "" || s.gatewayListener != nil)
+		ok := s.listener != nil &&
+			(opts.Cluster.Port == 0 || s.routeListener != nil) &&
+			(opts.Gateway.Name == "" || s.gatewayListener != nil) &&
+			(opts.LeafNode.Port == 0 || s.leafNodeListener != nil) &&
+			(opts.Websocket.Port == 0 || s.websocket.listener != nil)
 		s.mu.Unlock()
 		if ok {
 			return true

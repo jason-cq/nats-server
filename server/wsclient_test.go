@@ -14,14 +14,20 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"compress/flate"
+	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 type testReader struct {
@@ -960,6 +966,9 @@ type testResponseWriter struct {
 	http.ResponseWriter
 	buf     bytes.Buffer
 	headers http.Header
+	err     error
+	brw     *bufio.ReadWriter
+	conn    *testWSFakeNetConn
 }
 
 func (trw *testResponseWriter) Write(p []byte) (int, error) {
@@ -977,178 +986,237 @@ func (trw *testResponseWriter) Header() http.Header {
 	return trw.headers
 }
 
+type testWSFakeNetConn struct {
+	net.Conn
+	wbuf            bytes.Buffer
+	err             error
+	wsOpened        bool
+	isClosed        bool
+	deadlineCleared bool
+}
+
+func (c *testWSFakeNetConn) Write(p []byte) (int, error) {
+	if c.err != nil {
+		return 0, c.err
+	}
+	return c.wbuf.Write(p)
+}
+
+func (c *testWSFakeNetConn) SetDeadline(t time.Time) error {
+	if t.IsZero() {
+		c.deadlineCleared = true
+	}
+	return nil
+}
+
+func (c *testWSFakeNetConn) Close() error {
+	c.isClosed = true
+	return nil
+}
+
+func (trw *testResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if trw.conn == nil {
+		trw.conn = &testWSFakeNetConn{}
+	}
+	trw.conn.wsOpened = true
+	if trw.brw == nil {
+		trw.brw = bufio.NewReadWriter(bufio.NewReader(trw.conn), bufio.NewWriter(trw.conn))
+	}
+	return trw.conn, trw.brw, trw.err
+}
+
 func testWSOptions() *Options {
 	opts := DefaultOptions()
 	opts.Websocket.Port = -1
 	return opts
 }
 
+func testWSCreateValidReq() *http.Request {
+	req := &http.Request{
+		Method: "GET",
+		Host:   "http://host.com",
+		Proto:  "HTTP/1.1",
+	}
+	req.Header = make(http.Header)
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Sec-Websocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	req.Header.Set("Sec-Websocket-Version", "13")
+	return req
+}
+
 func TestWSUpgradeValidationErrors(t *testing.T) {
 	for _, test := range []struct {
 		name   string
-		setup  func() (*Options, *http.Request)
+		setup  func() (*Options, *testResponseWriter, *http.Request)
 		err    string
 		status int
 	}{
 		{
 			"bad method",
-			func() (*Options, *http.Request) {
+			func() (*Options, *testResponseWriter, *http.Request) {
 				opts := testWSOptions()
-				req := &http.Request{Method: "POST"}
-				return opts, req
+				req := testWSCreateValidReq()
+				req.Method = "POST"
+				return opts, nil, req
 			},
 			"must be GET",
 			http.StatusMethodNotAllowed,
 		},
 		{
 			"no host",
-			func() (*Options, *http.Request) {
+			func() (*Options, *testResponseWriter, *http.Request) {
 				opts := testWSOptions()
-				req := &http.Request{Method: "GET"}
-				return opts, req
+				req := testWSCreateValidReq()
+				req.Host = ""
+				return opts, nil, req
 			},
 			"'Host' missing in request",
 			http.StatusBadRequest,
 		},
 		{
 			"invalid upgrade header",
-			func() (*Options, *http.Request) {
+			func() (*Options, *testResponseWriter, *http.Request) {
 				opts := testWSOptions()
-				req := &http.Request{Method: "GET", Host: "host"}
-				return opts, req
+				req := testWSCreateValidReq()
+				req.Header.Del("Upgrade")
+				return opts, nil, req
 			},
 			"invalid value for header 'Uprade'",
 			http.StatusBadRequest,
 		},
 		{
 			"invalid connection header",
-			func() (*Options, *http.Request) {
+			func() (*Options, *testResponseWriter, *http.Request) {
 				opts := testWSOptions()
-				req := &http.Request{Method: "GET", Host: "host"}
-				req.Header = make(http.Header)
-				req.Header.Set("Upgrade", "websocket")
-				return opts, req
+				req := testWSCreateValidReq()
+				req.Header.Del("Connection")
+				return opts, nil, req
 			},
 			"invalid value for header 'Connection'",
 			http.StatusBadRequest,
 		},
 		{
 			"no key",
-			func() (*Options, *http.Request) {
+			func() (*Options, *testResponseWriter, *http.Request) {
 				opts := testWSOptions()
-				req := &http.Request{Method: "GET", Host: "host"}
-				req.Header = make(http.Header)
-				req.Header.Set("Upgrade", "websocket")
-				req.Header.Set("Connection", "Upgrade")
-				return opts, req
+				req := testWSCreateValidReq()
+				req.Header.Del("Sec-Websocket-Key")
+				return opts, nil, req
 			},
 			"key missing",
 			http.StatusBadRequest,
 		},
 		{
 			"empty key",
-			func() (*Options, *http.Request) {
+			func() (*Options, *testResponseWriter, *http.Request) {
 				opts := testWSOptions()
-				req := &http.Request{Method: "GET", Host: "host"}
-				req.Header = make(http.Header)
-				req.Header.Set("Upgrade", "websocket")
-				req.Header.Set("Connection", "Upgrade")
+				req := testWSCreateValidReq()
 				req.Header.Set("Sec-Websocket-Key", "")
-				return opts, req
+				return opts, nil, req
 			},
 			"key missing",
 			http.StatusBadRequest,
 		},
 		{
 			"missing version",
-			func() (*Options, *http.Request) {
+			func() (*Options, *testResponseWriter, *http.Request) {
 				opts := testWSOptions()
-				req := &http.Request{Method: "GET", Host: "host"}
-				req.Header = make(http.Header)
-				req.Header.Set("Upgrade", "websocket")
-				req.Header.Set("Connection", "Upgrade")
-				req.Header.Set("Sec-Websocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
-				return opts, req
+				req := testWSCreateValidReq()
+				req.Header.Del("Sec-Websocket-Version")
+				return opts, nil, req
 			},
 			"invalid version",
 			http.StatusBadRequest,
 		},
 		{
 			"wrong version",
-			func() (*Options, *http.Request) {
+			func() (*Options, *testResponseWriter, *http.Request) {
 				opts := testWSOptions()
-				req := &http.Request{Method: "GET", Host: "host"}
-				req.Header = make(http.Header)
-				req.Header.Set("Upgrade", "websocket")
-				req.Header.Set("Connection", "Upgrade")
-				req.Header.Set("Sec-Websocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+				req := testWSCreateValidReq()
 				req.Header.Set("Sec-Websocket-Version", "99")
-				return opts, req
+				return opts, nil, req
 			},
 			"invalid version",
 			http.StatusBadRequest,
 		},
 		{
 			"origin does not match request host",
-			func() (*Options, *http.Request) {
+			func() (*Options, *testResponseWriter, *http.Request) {
 				opts := testWSOptions()
 				opts.Websocket.CheckOrigin = true
-				req := &http.Request{Method: "GET", Host: "http://host.com"}
-				req.Header = make(http.Header)
-				req.Header.Set("Upgrade", "websocket")
-				req.Header.Set("Connection", "Upgrade")
-				req.Header.Set("Sec-Websocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
-				req.Header.Set("Sec-Websocket-Version", "13")
+				req := testWSCreateValidReq()
 				req.Header.Set("Origin", "http://bad.host.com")
-				return opts, req
+				return opts, nil, req
 			},
 			"invalid request origin",
 			http.StatusForbidden,
 		},
 		{
 			"origin does not match option origin",
-			func() (*Options, *http.Request) {
+			func() (*Options, *testResponseWriter, *http.Request) {
 				opts := testWSOptions()
 				opts.Websocket.CheckOrigin = true
 				opts.Websocket.Origin = "http://other.host.com"
-				req := &http.Request{Method: "GET", Host: "http://host.com"}
-				req.Header = make(http.Header)
-				req.Header.Set("Upgrade", "websocket")
-				req.Header.Set("Connection", "Upgrade")
-				req.Header.Set("Sec-Websocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
-				req.Header.Set("Sec-Websocket-Version", "13")
+				req := testWSCreateValidReq()
 				req.Header.Set("Origin", "http://host.com")
-				return opts, req
+				return opts, nil, req
 			},
 			"invalid request origin",
 			http.StatusForbidden,
 		},
 		{
 			"origin bad url",
-			func() (*Options, *http.Request) {
+			func() (*Options, *testResponseWriter, *http.Request) {
 				opts := testWSOptions()
 				opts.Websocket.CheckOrigin = true
 				opts.Websocket.Origin = "http://other.host.com"
-				req := &http.Request{Method: "GET", Host: "http://host.com"}
-				req.Header = make(http.Header)
-				req.Header.Set("Upgrade", "websocket")
-				req.Header.Set("Connection", "Upgrade")
-				req.Header.Set("Sec-Websocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
-				req.Header.Set("Sec-Websocket-Version", "13")
+				req := testWSCreateValidReq()
 				req.Header.Set("Origin", "http://this is a :: bad url")
-				return opts, req
+				return opts, nil, req
 			},
 			"invalid request origin",
 			http.StatusForbidden,
 		},
+		{
+			"hijack error",
+			func() (*Options, *testResponseWriter, *http.Request) {
+				opts := testWSOptions()
+				rw := &testResponseWriter{err: fmt.Errorf("on purpose")}
+				req := testWSCreateValidReq()
+				return opts, rw, req
+			},
+			"on purpose",
+			http.StatusInternalServerError,
+		},
+		{
+			"hijack buffered data",
+			func() (*Options, *testResponseWriter, *http.Request) {
+				opts := testWSOptions()
+				buf := &bytes.Buffer{}
+				buf.WriteString("some data")
+				rw := &testResponseWriter{
+					conn: &testWSFakeNetConn{},
+					brw:  bufio.NewReadWriter(bufio.NewReader(buf), bufio.NewWriter(nil)),
+				}
+				tmp := [1]byte{}
+				rw.brw.Read(tmp[:1])
+				req := testWSCreateValidReq()
+				return opts, rw, req
+			},
+			"client sent data before handshake is complete",
+			http.StatusBadRequest,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			opts, req := test.setup()
+			opts, rw, req := test.setup()
+			if rw == nil {
+				rw = &testResponseWriter{}
+			}
 			s := &Server{opts: opts}
-			rw := &testResponseWriter{}
 			res, err := s.wsUpgrade(rw, req)
 			if err == nil || !strings.Contains(err.Error(), test.err) {
-				t.Fatalf("Should get error %q, got %q", test.err, err)
+				t.Fatalf("Should get error %q, got %v", test.err, err)
 			}
 			if res != nil {
 				t.Fatalf("Should not have returned a result, got %v", res)
@@ -1157,6 +1225,291 @@ func TestWSUpgradeValidationErrors(t *testing.T) {
 			if got := rw.buf.String(); got != expected {
 				t.Fatalf("Expected %q got %q", expected, got)
 			}
+			// Check that if the connection was opened, it is now closed.
+			if rw.conn != nil && rw.conn.wsOpened && !rw.conn.isClosed {
+				t.Fatal("Connection was opened, but has not been closed")
+			}
 		})
 	}
+}
+
+func TestWSUpgradeResponseWriteError(t *testing.T) {
+	opts := testWSOptions()
+	s := &Server{opts: opts}
+	expectedErr := errors.New("on purpose")
+	rw := &testResponseWriter{
+		conn: &testWSFakeNetConn{err: expectedErr},
+	}
+	req := testWSCreateValidReq()
+	res, err := s.wsUpgrade(rw, req)
+	if err != expectedErr {
+		t.Fatalf("Should get error %q, got %v", expectedErr.Error(), err)
+	}
+	if res != nil {
+		t.Fatalf("Should not have returned a result, got %v", res)
+	}
+	if !rw.conn.isClosed {
+		t.Fatal("Connection should have been closed")
+	}
+}
+
+func TestWSUpgradeConnDeadline(t *testing.T) {
+	opts := testWSOptions()
+	opts.Websocket.HandshakeTimeout = time.Second
+	s := &Server{opts: opts}
+	rw := &testResponseWriter{}
+	req := testWSCreateValidReq()
+	res, err := s.wsUpgrade(rw, req)
+	if res == nil || err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if rw.conn.isClosed {
+		t.Fatal("Connection should NOT have been closed")
+	}
+	if !rw.conn.deadlineCleared {
+		t.Fatal("Connection deadline should have been cleared after handshake")
+	}
+}
+
+func TestWSCompressNegotiation(t *testing.T) {
+	// No compression on the server, but client asks
+	opts := testWSOptions()
+	s := &Server{opts: opts}
+	rw := &testResponseWriter{}
+	req := testWSCreateValidReq()
+	req.Header.Set("Sec-Websocket-Extensions", "permessage-deflate")
+	res, err := s.wsUpgrade(rw, req)
+	if res == nil || err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	// The http response should not contain "permessage-deflate"
+	output := rw.conn.wbuf.String()
+	if strings.Contains(output, "permessage-deflate") {
+		t.Fatalf("Compression disabled in server so response to client should not contain extension, got %s", output)
+	}
+
+	// Option in the server and client, so compression should be negotiated.
+	s.opts.Websocket.Compression = true
+	s.opts.Websocket.CompressionLevel = defaultCompressionLevel
+	rw = &testResponseWriter{}
+	res, err = s.wsUpgrade(rw, req)
+	if res == nil || err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	// The http response should not contain "permessage-deflate"
+	output = rw.conn.wbuf.String()
+	if !strings.Contains(output, "permessage-deflate") {
+		t.Fatalf("Compression in server and client request, so response should contain extension, got %s", output)
+	}
+
+	// Option in server but not asked by the client, so response should not contain "permessage-deflate"
+	rw = &testResponseWriter{}
+	req.Header.Del("Sec-Websocket-Extensions")
+	res, err = s.wsUpgrade(rw, req)
+	if res == nil || err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	// The http response should not contain "permessage-deflate"
+	output = rw.conn.wbuf.String()
+	if strings.Contains(output, "permessage-deflate") {
+		t.Fatalf("Compression in server but not in client, so response to client should not contain extension, got %s", output)
+	}
+}
+
+func TestWSCheckOriginButClientDoesNotSetIt(t *testing.T) {
+	// Spec says that if origin is not set on the client, then server should not check/reject
+	opts := testWSOptions()
+	opts.Websocket.CheckOrigin = true
+	s := &Server{opts: opts}
+	rw := &testResponseWriter{}
+	req := testWSCreateValidReq()
+	res, err := s.wsUpgrade(rw, req)
+	if res == nil || err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Add also expected origin, and again, this should not prevent client request to be accepted.
+	opts.Websocket.Origin = "this.host.com"
+	rw = &testResponseWriter{}
+	req = testWSCreateValidReq()
+	res, err = s.wsUpgrade(rw, req)
+	if res == nil || err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+}
+
+func TestWSValidateOptions(t *testing.T) {
+	o := DefaultOptions()
+	if err := validateWebsocketOptions(o); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	o.Websocket.Port = -1
+	badLevels := []int{-10, 20}
+	for _, bl := range badLevels {
+		t.Run("bad compression level", func(t *testing.T) {
+			o.Websocket.CompressionLevel = bl
+			if err := validateWebsocketOptions(o); err == nil || !strings.Contains(err.Error(), "valid range") {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestWSPubSub(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		compression bool
+	}{
+		{"no compression", false},
+		{"compression", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			o := testWSOptions()
+			if test.compression {
+				o.Websocket.Compression = true
+				o.Websocket.CompressionLevel = defaultCompressionLevel
+			}
+			s := RunServer(o)
+			defer s.Shutdown()
+
+			// Create a regular client to subscribe
+			nc := natsConnect(t, s.ClientURL())
+			defer nc.Close()
+			nsub := natsSubSync(t, nc, "foo")
+			checkExpectedSubs(t, 1, s)
+
+			// Now create a WS client and send a message on "foo"
+			addr := fmt.Sprintf("%s:%d", o.Websocket.Host, o.Websocket.Port)
+			wsc, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatalf("Error creating ws connection: %v", err)
+			}
+			defer wsc.Close()
+
+			req := testWSCreateValidReq()
+			if test.compression {
+				req.Header.Set("Sec-Websocket-Extensions", "permessage-deflate")
+			}
+			req.URL, _ = url.Parse("ws://" + addr)
+			if err := req.Write(wsc); err != nil {
+				t.Fatalf("Error sending request: %v", err)
+			}
+			br := bufio.NewReader(wsc)
+			resp, err := http.ReadResponse(br, req)
+			if err != nil {
+				t.Fatalf("Error reading response: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusSwitchingProtocols {
+				t.Fatalf("Expected response status %v, got %v", http.StatusSwitchingProtocols, resp.StatusCode)
+			}
+
+			// Send our connect, although we don't have to for test to work.
+			wsmsg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("CONNECT {\"verbose\":false}\r\n"))
+			if _, err := wsc.Write(wsmsg); err != nil {
+				t.Fatalf("Error sending message: %v", err)
+			}
+
+			// Send a WS message for "PUB foo 2\r\nok\r\n"
+			wsmsg = testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("PUB foo 7\r\nfrom ws\r\n"))
+			if _, err := wsc.Write(wsmsg); err != nil {
+				t.Fatalf("Error sending message: %v", err)
+			}
+
+			// Now check that message is received
+			msg := natsNexMsg(t, nsub, time.Second)
+			if string(msg.Data) != "from ws" {
+				t.Fatalf("Expected message to be %q, got %q", "ok", string(msg.Data))
+			}
+
+			// Now do reverse, create a subscription on WS client on bar
+			wsmsg = testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("SUB bar 1\r\n"))
+			if _, err := wsc.Write(wsmsg); err != nil {
+				t.Fatalf("Error sending subscription: %v", err)
+			}
+			// Wait for it to be registered on server
+			checkExpectedSubs(t, 2, s)
+			// Now publish from NATS connection and verify received on WS client
+			natsPub(t, nc, "bar", []byte("from nats"))
+			natsFlush(t, nc)
+
+			// Check for the "from nats" message...
+			// Set some deadline so we are not stuck forever on failure
+			wsc.SetReadDeadline(time.Now().Add(10 * time.Second))
+			ok := 0
+			for {
+				line, _, err := br.ReadLine()
+				if err != nil {
+					t.Fatalf("Error reading: %v", err)
+				}
+				// Note that this works even in compression test because those
+				// texts are likely not to be compressed, but compression code is
+				// still executed.
+				if ok == 0 && bytes.Contains(line, []byte("MSG bar 1 9")) {
+					ok = 1
+					continue
+				} else if ok == 1 && bytes.Contains(line, []byte("from nats")) {
+					ok = 2
+					break
+				}
+			}
+		})
+	}
+}
+
+func TestWSTLSConnection(t *testing.T) {
+	o := testWSOptions()
+	tc := &TLSConfigOpts{
+		CertFile: "./configs/certs/server.pem",
+		KeyFile:  "./configs/certs/key.pem",
+	}
+	o.Websocket.TLSConfig, _ = GenTLSConfig(tc)
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	addr := fmt.Sprintf("%s:%d", o.Websocket.Host, o.Websocket.Port)
+	req := testWSCreateValidReq()
+	req.URL, _ = url.Parse("wss://" + addr)
+
+	wsc, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Error creating ws connection: %v", err)
+	}
+	defer wsc.Close()
+	if err := req.Write(wsc); err != nil {
+		t.Fatalf("Error sending request: %v", err)
+	}
+	br := bufio.NewReader(wsc)
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		t.Fatalf("Error reading response: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("Expected status %v, got %v", http.StatusBadRequest, resp.StatusCode)
+	}
+	wsc.Close()
+
+	wsc, err = net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Error creating ws connection: %v", err)
+	}
+	defer wsc.Close()
+	wsc = tls.Client(wsc, &tls.Config{InsecureSkipVerify: true})
+	if err := wsc.(*tls.Conn).Handshake(); err != nil {
+		t.Fatalf("Error during handshake: %v", err)
+	}
+	if err := req.Write(wsc); err != nil {
+		t.Fatalf("Error sending request: %v", err)
+	}
+	br = bufio.NewReader(wsc)
+	resp, err = http.ReadResponse(br, req)
+	if err != nil {
+		t.Fatalf("Error reading response: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("Expected status %v, got %v", http.StatusSwitchingProtocols, resp.StatusCode)
+	}
+	wsc.Close()
 }
