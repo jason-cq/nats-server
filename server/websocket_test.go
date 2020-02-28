@@ -22,10 +22,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1027,6 +1030,7 @@ func (trw *testResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 func testWSOptions() *Options {
 	opts := DefaultOptions()
+	opts.Websocket.Host = "127.0.0.1"
 	opts.Websocket.Port = -1
 	return opts
 }
@@ -1200,7 +1204,7 @@ func TestWSUpgradeValidationErrors(t *testing.T) {
 					brw:  bufio.NewReadWriter(bufio.NewReader(buf), bufio.NewWriter(nil)),
 				}
 				tmp := [1]byte{}
-				rw.brw.Read(tmp[:1])
+				io.ReadAtLeast(rw.brw, tmp[:1], 1)
 				req := testWSCreateValidReq()
 				return opts, rw, req
 			},
@@ -1355,6 +1359,159 @@ func TestWSValidateOptions(t *testing.T) {
 	}
 }
 
+type captureFatalLogger struct {
+	DummyLogger
+	fatalCh chan string
+}
+
+func (l *captureFatalLogger) Fatalf(format string, v ...interface{}) {
+	select {
+	case l.fatalCh <- fmt.Sprintf(format, v...):
+	default:
+	}
+}
+
+func TestWSFailureToStartServer(t *testing.T) {
+	// Create a listener to use a port
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Error listening: %v", err)
+	}
+	defer l.Close()
+
+	o := testWSOptions()
+	o.Websocket.Port = l.Addr().(*net.TCPAddr).Port
+	s, err := NewServer(o)
+	if err != nil {
+		t.Fatalf("Error creating server: %v", err)
+	}
+	defer s.Shutdown()
+	logger := &captureFatalLogger{fatalCh: make(chan string, 1)}
+	s.SetLogger(logger, false, false)
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		s.Start()
+		wg.Done()
+	}()
+
+	select {
+	case e := <-logger.fatalCh:
+		if !strings.Contains(e, "Unable to listen") {
+			t.Fatalf("Unexpected error: %v", e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Should have reported a fatal error")
+	}
+	s.Shutdown()
+	wg.Wait()
+}
+
+func TestWSAbnormalFailureOfWebServer(t *testing.T) {
+	o := testWSOptions()
+	s := RunServer(o)
+	defer s.Shutdown()
+	logger := &captureFatalLogger{fatalCh: make(chan string, 1)}
+	s.SetLogger(logger, false, false)
+
+	// Now close the WS listener to cause a WebServer error
+	s.mu.Lock()
+	s.websocket.listener.Close()
+	s.mu.Unlock()
+
+	select {
+	case e := <-logger.fatalCh:
+		if !strings.Contains(e, "websocket listener error") {
+			t.Fatalf("Unexpected error: %v", e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Should have reported a fatal error")
+	}
+}
+
+func testWSCreateClient(t testing.TB, compress bool, host string, port int) (net.Conn, *bufio.Reader) {
+	addr := fmt.Sprintf("%s:%d", host, port)
+	wsc, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Error creating ws connection: %v", err)
+	}
+	req := testWSCreateValidReq()
+	if compress {
+		req.Header.Set("Sec-Websocket-Extensions", "permessage-deflate")
+	}
+	req.URL, _ = url.Parse("ws://" + addr)
+	if err := req.Write(wsc); err != nil {
+		t.Fatalf("Error sending request: %v", err)
+	}
+	br := bufio.NewReader(wsc)
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		t.Fatalf("Error reading response: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("Expected response status %v, got %v", http.StatusSwitchingProtocols, resp.StatusCode)
+	}
+	// Wait for the INFO
+	if msg := testWSReadFrame(t, br); !bytes.HasPrefix(msg, []byte("INFO {")) {
+		t.Fatalf("Expected INFO, got %s", msg)
+	}
+	// Send CONNECT
+	wsmsg := testWSCreateClientMsg(wsBinaryMessage, 1, true, compress, []byte("CONNECT {\"verbose\":false}\r\n"))
+	if _, err := wsc.Write(wsmsg); err != nil {
+		t.Fatalf("Error sending message: %v", err)
+	}
+	return wsc, br
+}
+
+func testWSReadFrame(t testing.TB, br *bufio.Reader) []byte {
+	fh := [2]byte{}
+	if _, err := io.ReadAtLeast(br, fh[:2], 2); err != nil {
+		t.Fatalf("Error reading frame: %v", err)
+	}
+	fc := fh[0]&wsRsv1Bit != 0
+	sb := fh[1]
+	size := 0
+	switch {
+	case sb <= 125:
+		size = int(sb)
+	case sb == 126:
+		tmp := [2]byte{}
+		if _, err := io.ReadAtLeast(br, tmp[:2], 2); err != nil {
+			t.Fatalf("Error reading frame: %v", err)
+		}
+		size = int(binary.BigEndian.Uint16(tmp[:2]))
+	case sb == 127:
+		tmp := [8]byte{}
+		if _, err := io.ReadAtLeast(br, tmp[:8], 8); err != nil {
+			t.Fatalf("Error reading frame: %v", err)
+		}
+		size = int(binary.BigEndian.Uint64(tmp[:8]))
+	}
+	buf := make([]byte, size)
+	if _, err := io.ReadAtLeast(br, buf, size); err != nil {
+		t.Fatalf("Error reading frame: %v", err)
+	}
+	if !fc {
+		return buf
+	}
+	buf = append(buf, 0x00, 0x00, 0xff, 0xff, 0x01, 0x00, 0x00, 0xff, 0xff)
+	dbr := bytes.NewBuffer(buf)
+	d, _ := decompressorPool.Get().(io.ReadCloser)
+	if d == nil {
+		d = flate.NewReader(dbr)
+	} else {
+		d.(flate.Resetter).Reset(dbr, nil)
+	}
+	uncompressed, err := ioutil.ReadAll(d)
+	if err != nil {
+		t.Fatalf("Error reading frame: %v", err)
+	}
+	decompressorPool.Put(d)
+	return uncompressed
+}
+
 func TestWSPubSub(t *testing.T) {
 	for _, test := range []struct {
 		name        string
@@ -1379,39 +1536,11 @@ func TestWSPubSub(t *testing.T) {
 			checkExpectedSubs(t, 1, s)
 
 			// Now create a WS client and send a message on "foo"
-			addr := fmt.Sprintf("%s:%d", o.Websocket.Host, o.Websocket.Port)
-			wsc, err := net.Dial("tcp", addr)
-			if err != nil {
-				t.Fatalf("Error creating ws connection: %v", err)
-			}
+			wsc, br := testWSCreateClient(t, test.compression, o.Websocket.Host, o.Websocket.Port)
 			defer wsc.Close()
 
-			req := testWSCreateValidReq()
-			if test.compression {
-				req.Header.Set("Sec-Websocket-Extensions", "permessage-deflate")
-			}
-			req.URL, _ = url.Parse("ws://" + addr)
-			if err := req.Write(wsc); err != nil {
-				t.Fatalf("Error sending request: %v", err)
-			}
-			br := bufio.NewReader(wsc)
-			resp, err := http.ReadResponse(br, req)
-			if err != nil {
-				t.Fatalf("Error reading response: %v", err)
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusSwitchingProtocols {
-				t.Fatalf("Expected response status %v, got %v", http.StatusSwitchingProtocols, resp.StatusCode)
-			}
-
-			// Send our connect, although we don't have to for test to work.
-			wsmsg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("CONNECT {\"verbose\":false}\r\n"))
-			if _, err := wsc.Write(wsmsg); err != nil {
-				t.Fatalf("Error sending message: %v", err)
-			}
-
 			// Send a WS message for "PUB foo 2\r\nok\r\n"
-			wsmsg = testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("PUB foo 7\r\nfrom ws\r\n"))
+			wsmsg := testWSCreateClientMsg(wsBinaryMessage, 1, true, false, []byte("PUB foo 7\r\nfrom ws\r\n"))
 			if _, err := wsc.Write(wsmsg); err != nil {
 				t.Fatalf("Error sending message: %v", err)
 			}
@@ -1471,11 +1600,102 @@ func TestWSTLSConnection(t *testing.T) {
 	req := testWSCreateValidReq()
 	req.URL, _ = url.Parse("wss://" + addr)
 
+	for _, test := range []struct {
+		name   string
+		useTLS bool
+		status int
+	}{
+		{"client does use TLS", false, http.StatusBadRequest},
+		{"client uses TLS", true, http.StatusSwitchingProtocols},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			wsc, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatalf("Error creating ws connection: %v", err)
+			}
+			defer wsc.Close()
+			if test.useTLS {
+				wsc = tls.Client(wsc, &tls.Config{InsecureSkipVerify: true})
+				if err := wsc.(*tls.Conn).Handshake(); err != nil {
+					t.Fatalf("Error during handshake: %v", err)
+				}
+			}
+			if err := req.Write(wsc); err != nil {
+				t.Fatalf("Error sending request: %v", err)
+			}
+			br := bufio.NewReader(wsc)
+			resp, err := http.ReadResponse(br, req)
+			if err != nil {
+				t.Fatalf("Error reading response: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != test.status {
+				t.Fatalf("Expected status %v, got %v", test.status, resp.StatusCode)
+			}
+		})
+	}
+}
+
+func TestWSHandshakeTimeout(t *testing.T) {
+	o := testWSOptions()
+	o.Websocket.HandshakeTimeout = time.Millisecond
+	tc := &TLSConfigOpts{
+		CertFile: "./configs/certs/server.pem",
+		KeyFile:  "./configs/certs/key.pem",
+	}
+	o.Websocket.TLSConfig, _ = GenTLSConfig(tc)
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	logger := &captureErrorLogger{errCh: make(chan string, 1)}
+	s.SetLogger(logger, false, false)
+
+	addr := fmt.Sprintf("%s:%d", o.Websocket.Host, o.Websocket.Port)
 	wsc, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("Error creating ws connection: %v", err)
 	}
 	defer wsc.Close()
+
+	// Delay the handshake
+	wsc = tls.Client(wsc, &tls.Config{InsecureSkipVerify: true})
+	time.Sleep(20 * time.Millisecond)
+	// We expect error since the server should have cut us off
+	if err := wsc.(*tls.Conn).Handshake(); err == nil {
+		t.Fatal("Expected error during handshake")
+	}
+
+	// Check that server logs error
+	select {
+	case e := <-logger.errCh:
+		if !strings.Contains(e, "timeout") {
+			t.Fatalf("Unexpected error: %v", e)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("Should have timed-out")
+	}
+}
+
+func TestWSServerReportUpgradeFailure(t *testing.T) {
+	o := testWSOptions()
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	logger := &captureErrorLogger{errCh: make(chan string, 1)}
+	s.SetLogger(logger, false, false)
+
+	addr := fmt.Sprintf("%s:%d", o.Websocket.Host, o.Websocket.Port)
+	req := testWSCreateValidReq()
+	req.URL, _ = url.Parse("wss://" + addr)
+
+	wsc, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Error creating ws connection: %v", err)
+	}
+	defer wsc.Close()
+	// Remove a required field from the request to have it fail
+	req.Header.Del("Connection")
+	// Send the request
 	if err := req.Write(wsc); err != nil {
 		t.Fatalf("Error sending request: %v", err)
 	}
@@ -1488,28 +1708,411 @@ func TestWSTLSConnection(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("Expected status %v, got %v", http.StatusBadRequest, resp.StatusCode)
 	}
-	wsc.Close()
 
-	wsc, err = net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("Error creating ws connection: %v", err)
+	// Check that server logs error
+	select {
+	case e := <-logger.errCh:
+		if !strings.Contains(e, "invalid value for header 'Connection'") {
+			t.Fatalf("Unexpected error: %v", e)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("Should have timed-out")
 	}
-	defer wsc.Close()
-	wsc = tls.Client(wsc, &tls.Config{InsecureSkipVerify: true})
-	if err := wsc.(*tls.Conn).Handshake(); err != nil {
-		t.Fatalf("Error during handshake: %v", err)
+}
+
+// ==================================================================
+// = Benchmark tests
+// ==================================================================
+
+const testWSBenchSubject = "a"
+
+var ch = []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@$#%^&*()")
+
+func sizedString(sz int) string {
+	b := make([]byte, sz)
+	for i := range b {
+		b[i] = ch[rand.Intn(len(ch))]
 	}
-	if err := req.Write(wsc); err != nil {
-		t.Fatalf("Error sending request: %v", err)
+	return string(b)
+}
+
+func sizedStringForCompression(sz int) string {
+	b := make([]byte, sz)
+	c := byte(0)
+	s := 0
+	for i := range b {
+		if s%20 == 0 {
+			c = ch[rand.Intn(len(ch))]
+		}
+		b[i] = c
 	}
-	br = bufio.NewReader(wsc)
-	resp, err = http.ReadResponse(br, req)
-	if err != nil {
-		t.Fatalf("Error reading response: %v", err)
+	return string(b)
+}
+
+func testWSFlushConn(b *testing.B, compress bool, c net.Conn, br *bufio.Reader) {
+	buf := testWSCreateClientMsg(wsBinaryMessage, 1, true, compress, []byte(pingProto))
+	c.Write(buf)
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	res := testWSReadFrame(b, br)
+	c.SetReadDeadline(time.Time{})
+	if !bytes.HasPrefix(res, []byte(pongProto)) {
+		b.Fatalf("Failed read of PONG: %s\n", res)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusSwitchingProtocols {
-		t.Fatalf("Expected status %v, got %v", http.StatusSwitchingProtocols, resp.StatusCode)
+}
+
+func wsBenchPub(b *testing.B, numPubs int, compress bool, payload string) {
+	b.StopTimer()
+	opts := testWSOptions()
+	opts.DisableShortFirstPing = true
+	opts.Websocket.Host = "127.0.0.1"
+	opts.Websocket.Port = -1
+	opts.Websocket.Compression = compress
+	opts.Websocket.CompressionLevel = defaultCompressionLevel
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	n := b.N
+	extra := 0
+	pubProto := []byte(fmt.Sprintf("PUB %s %d\r\n%s\r\n", testWSBenchSubject, len(payload), payload))
+	singleOpBuf := testWSCreateClientMsg(wsBinaryMessage, 1, true, compress, pubProto)
+
+	// Simulate client that would buffer messages before framing/sending.
+	// Figure out how many we can fit in one frame based on b.N and length of pubProto
+	const bufSize = 32768
+	tmpa := [bufSize]byte{}
+	tmp := tmpa[:0]
+	pb := 0
+	for i := 0; i < b.N; i++ {
+		tmp = append(tmp, pubProto...)
+		pb++
+		if len(tmp) >= bufSize {
+			break
+		}
 	}
-	wsc.Close()
+	sendBuf := testWSCreateClientMsg(wsBinaryMessage, 1, true, compress, tmp)
+	n = b.N / pb
+	extra = b.N - (n * pb)
+
+	wg := sync.WaitGroup{}
+	wg.Add(numPubs)
+
+	type pub struct {
+		c  net.Conn
+		br *bufio.Reader
+		bw *bufio.Writer
+	}
+	var pubs []pub
+	for i := 0; i < numPubs; i++ {
+		wsc, br := testWSCreateClient(b, compress, opts.Websocket.Host, opts.Websocket.Port)
+		defer wsc.Close()
+		bw := bufio.NewWriterSize(wsc, bufSize)
+		pubs = append(pubs, pub{wsc, br, bw})
+	}
+
+	// Average the amount of bytes sent by iteration
+	avg := len(sendBuf) / pb
+	if extra > 0 {
+		avg += len(singleOpBuf)
+		avg /= 2
+	}
+	b.SetBytes(int64(numPubs * avg))
+	b.StartTimer()
+
+	for i := 0; i < numPubs; i++ {
+		p := pubs[i]
+		go func(p pub) {
+			defer wg.Done()
+			for i := 0; i < n; i++ {
+				p.bw.Write(sendBuf)
+			}
+			for i := 0; i < extra; i++ {
+				p.bw.Write(singleOpBuf)
+			}
+			p.bw.Flush()
+			testWSFlushConn(b, compress, p.c, p.br)
+		}(p)
+	}
+	wg.Wait()
+	b.StopTimer()
+}
+
+func Benchmark_WS_Pubx1_CN_____0b(b *testing.B) {
+	wsBenchPub(b, 1, false, "")
+}
+
+func Benchmark_WS_Pubx1_CY_____0b(b *testing.B) {
+	wsBenchPub(b, 1, true, "")
+}
+
+func Benchmark_WS_Pubx1_CN___128b(b *testing.B) {
+	s := sizedString(128)
+	wsBenchPub(b, 1, false, s)
+}
+
+func Benchmark_WS_Pubx1_CY___128b(b *testing.B) {
+	s := sizedStringForCompression(128)
+	wsBenchPub(b, 1, true, s)
+}
+
+func Benchmark_WS_Pubx1_CN__1024b(b *testing.B) {
+	s := sizedString(1024)
+	wsBenchPub(b, 1, false, s)
+}
+
+func Benchmark_WS_Pubx1_CY__1024b(b *testing.B) {
+	s := sizedStringForCompression(1024)
+	wsBenchPub(b, 1, true, s)
+}
+
+func Benchmark_WS_Pubx1_CN__4096b(b *testing.B) {
+	s := sizedString(4 * 1024)
+	wsBenchPub(b, 1, false, s)
+}
+
+func Benchmark_WS_Pubx1_CY__4096b(b *testing.B) {
+	s := sizedStringForCompression(4 * 1024)
+	wsBenchPub(b, 1, true, s)
+}
+
+func Benchmark_WS_Pubx1_CN__8192b(b *testing.B) {
+	s := sizedString(8 * 1024)
+	wsBenchPub(b, 1, false, s)
+}
+
+func Benchmark_WS_Pubx1_CY__8192b(b *testing.B) {
+	s := sizedStringForCompression(8 * 1024)
+	wsBenchPub(b, 1, true, s)
+}
+
+func Benchmark_WS_Pubx1_CN_32768b(b *testing.B) {
+	s := sizedString(32 * 1024)
+	wsBenchPub(b, 1, false, s)
+}
+
+func Benchmark_WS_Pubx1_CY_32768b(b *testing.B) {
+	s := sizedStringForCompression(32 * 1024)
+	wsBenchPub(b, 1, true, s)
+}
+
+func Benchmark_WS_Pubx5_CN_____0b(b *testing.B) {
+	wsBenchPub(b, 5, false, "")
+}
+
+func Benchmark_WS_Pubx5_CY_____0b(b *testing.B) {
+	wsBenchPub(b, 5, true, "")
+}
+
+func Benchmark_WS_Pubx5_CN___128b(b *testing.B) {
+	s := sizedString(128)
+	wsBenchPub(b, 5, false, s)
+}
+
+func Benchmark_WS_Pubx5_CY___128b(b *testing.B) {
+	s := sizedStringForCompression(128)
+	wsBenchPub(b, 5, true, s)
+}
+
+func Benchmark_WS_Pubx5_CN__1024b(b *testing.B) {
+	s := sizedString(1024)
+	wsBenchPub(b, 5, false, s)
+}
+
+func Benchmark_WS_Pubx5_CY__1024b(b *testing.B) {
+	s := sizedStringForCompression(1024)
+	wsBenchPub(b, 5, true, s)
+}
+
+func Benchmark_WS_Pubx5_CN__4096b(b *testing.B) {
+	s := sizedString(4 * 1024)
+	wsBenchPub(b, 5, false, s)
+}
+
+func Benchmark_WS_Pubx5_CY__4096b(b *testing.B) {
+	s := sizedStringForCompression(4 * 1024)
+	wsBenchPub(b, 5, true, s)
+}
+
+func Benchmark_WS_Pubx5_CN__8192b(b *testing.B) {
+	s := sizedString(8 * 1024)
+	wsBenchPub(b, 5, false, s)
+}
+
+func Benchmark_WS_Pubx5_CY__8192b(b *testing.B) {
+	s := sizedStringForCompression(8 * 1024)
+	wsBenchPub(b, 5, true, s)
+}
+
+func Benchmark_WS_Pubx5_CN_32768b(b *testing.B) {
+	s := sizedString(32 * 1024)
+	wsBenchPub(b, 5, false, s)
+}
+
+func Benchmark_WS_Pubx5_CY_32768b(b *testing.B) {
+	s := sizedStringForCompression(32 * 1024)
+	wsBenchPub(b, 5, true, s)
+}
+
+func wsBenchSub(b *testing.B, numSubs int, compress bool, payload string) {
+	b.StopTimer()
+	opts := testWSOptions()
+	opts.DisableShortFirstPing = true
+	opts.Websocket.Host = "127.0.0.1"
+	opts.Websocket.Port = -1
+	opts.Websocket.Compression = compress
+	opts.Websocket.CompressionLevel = defaultCompressionLevel
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	var subs []*bufio.Reader
+	for i := 0; i < numSubs; i++ {
+		wsc, br := testWSCreateClient(b, compress, opts.Websocket.Host, opts.Websocket.Port)
+		defer wsc.Close()
+		subProto := testWSCreateClientMsg(wsBinaryMessage, 1, true, compress,
+			[]byte(fmt.Sprintf("SUB %s 1\r\nPING\r\n", testWSBenchSubject)))
+		wsc.Write(subProto)
+		// Waiting for PONG
+		testWSReadFrame(b, br)
+		subs = append(subs, br)
+	}
+
+	wg := sync.WaitGroup{}
+	wg.Add(numSubs)
+
+	// Use regular NATS client to publish messages
+	nc := natsConnect(b, s.ClientURL())
+	defer nc.Close()
+
+	b.StartTimer()
+
+	for i := 0; i < numSubs; i++ {
+		br := subs[i]
+		go func(br *bufio.Reader) {
+			defer wg.Done()
+			for count := 0; count < b.N; {
+				msgs := testWSReadFrame(b, br)
+				count += bytes.Count(msgs, []byte("MSG "))
+			}
+		}(br)
+	}
+	for i := 0; i < b.N; i++ {
+		natsPub(b, nc, testWSBenchSubject, []byte(payload))
+	}
+	wg.Wait()
+	b.StopTimer()
+}
+
+func Benchmark_WS_Subx1_CN_____0b(b *testing.B) {
+	wsBenchSub(b, 1, false, "")
+}
+
+func Benchmark_WS_Subx1_CY_____0b(b *testing.B) {
+	wsBenchSub(b, 1, true, "")
+}
+
+func Benchmark_WS_Subx1_CN___128b(b *testing.B) {
+	s := sizedString(128)
+	wsBenchSub(b, 1, false, s)
+}
+
+func Benchmark_WS_Subx1_CY___128b(b *testing.B) {
+	s := sizedStringForCompression(128)
+	wsBenchSub(b, 1, true, s)
+}
+
+func Benchmark_WS_Subx1_CN__1024b(b *testing.B) {
+	s := sizedString(1024)
+	wsBenchSub(b, 1, false, s)
+}
+
+func Benchmark_WS_Subx1_CY__1024b(b *testing.B) {
+	s := sizedStringForCompression(1024)
+	wsBenchSub(b, 1, true, s)
+}
+
+func Benchmark_WS_Subx1_CN__4096b(b *testing.B) {
+	s := sizedString(4096)
+	wsBenchSub(b, 1, false, s)
+}
+
+func Benchmark_WS_Subx1_CY__4096b(b *testing.B) {
+	s := sizedStringForCompression(4096)
+	wsBenchSub(b, 1, true, s)
+}
+
+func Benchmark_WS_Subx1_CN__8192b(b *testing.B) {
+	s := sizedString(8192)
+	wsBenchSub(b, 1, false, s)
+}
+
+func Benchmark_WS_Subx1_CY__8192b(b *testing.B) {
+	s := sizedStringForCompression(8192)
+	wsBenchSub(b, 1, true, s)
+}
+
+func Benchmark_WS_Subx1_CN_32768b(b *testing.B) {
+	s := sizedString(32768)
+	wsBenchSub(b, 1, false, s)
+}
+
+func Benchmark_WS_Subx1_CY_32768b(b *testing.B) {
+	s := sizedStringForCompression(32768)
+	wsBenchSub(b, 1, true, s)
+}
+
+func Benchmark_WS_Subx5_CN_____0b(b *testing.B) {
+	wsBenchSub(b, 5, false, "")
+}
+
+func Benchmark_WS_Subx5_CY_____0b(b *testing.B) {
+	wsBenchSub(b, 5, true, "")
+}
+
+func Benchmark_WS_Subx5_CN___128b(b *testing.B) {
+	s := sizedString(128)
+	wsBenchSub(b, 5, false, s)
+}
+
+func Benchmark_WS_Subx5_CY___128b(b *testing.B) {
+	s := sizedStringForCompression(128)
+	wsBenchSub(b, 5, true, s)
+}
+
+func Benchmark_WS_Subx5_CN__1024b(b *testing.B) {
+	s := sizedString(1024)
+	wsBenchSub(b, 5, false, s)
+}
+
+func Benchmark_WS_Subx5_CY__1024b(b *testing.B) {
+	s := sizedStringForCompression(1024)
+	wsBenchSub(b, 5, true, s)
+}
+
+func Benchmark_WS_Subx5_CN__4096b(b *testing.B) {
+	s := sizedString(4096)
+	wsBenchSub(b, 5, false, s)
+}
+
+func Benchmark_WS_Subx5_CY__4096b(b *testing.B) {
+	s := sizedStringForCompression(4096)
+	wsBenchSub(b, 5, true, s)
+}
+
+func Benchmark_WS_Subx5_CN__8192b(b *testing.B) {
+	s := sizedString(8192)
+	wsBenchSub(b, 5, false, s)
+}
+
+func Benchmark_WS_Subx5_CY__8192b(b *testing.B) {
+	s := sizedStringForCompression(8192)
+	wsBenchSub(b, 5, true, s)
+}
+
+func Benchmark_WS_Subx5_CN_32768b(b *testing.B) {
+	s := sizedString(32768)
+	wsBenchSub(b, 5, false, s)
+}
+
+func Benchmark_WS_Subx5_CY_32768b(b *testing.B) {
+	s := sizedStringForCompression(32768)
+	wsBenchSub(b, 5, true, s)
 }
